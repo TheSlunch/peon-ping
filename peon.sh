@@ -12,21 +12,21 @@ INPUT=$(cat)
 # Debug log (comment out for quiet operation)
 # echo "$(date): peon hook — $INPUT" >> /tmp/peon-ping-debug.log
 
-# --- Load config ---
+# --- Load config (shlex.quote prevents shell injection) ---
 eval "$(/usr/bin/python3 -c "
-import json, sys
+import json, shlex
 try:
     c = json.load(open('$CONFIG'))
 except:
     c = {}
-print('ENABLED=' + repr(str(c.get('enabled', True)).lower()))
-print('VOLUME=' + repr(str(c.get('volume', 0.5))))
-print('ACTIVE_PACK=' + repr(c.get('active_pack', 'peon')))
-print('ANNOYED_THRESHOLD=' + repr(str(c.get('annoyed_threshold', 3))))
-print('ANNOYED_WINDOW=' + repr(str(c.get('annoyed_window_seconds', 10))))
+print('ENABLED=' + shlex.quote(str(c.get('enabled', True)).lower()))
+print('VOLUME=' + shlex.quote(str(c.get('volume', 0.5))))
+print('ACTIVE_PACK=' + shlex.quote(c.get('active_pack', 'peon')))
+print('ANNOYED_THRESHOLD=' + shlex.quote(str(c.get('annoyed_threshold', 3))))
+print('ANNOYED_WINDOW=' + shlex.quote(str(c.get('annoyed_window_seconds', 10))))
 cats = c.get('categories', {})
 for cat in ['greeting','acknowledge','complete','error','permission','resource_limit','annoyed']:
-    print('CAT_' + cat.upper() + '=' + repr(str(cats.get(cat, True)).lower()))
+    print('CAT_' + cat.upper() + '=' + shlex.quote(str(cats.get(cat, True)).lower()))
 " 2>/dev/null)"
 
 [ "$ENABLED" = "false" ] && exit 0
@@ -48,17 +48,19 @@ resolve_tty() {
 
 MY_TTY=$(resolve_tty)
 
-# --- Parse event fields ---
+# --- Parse event fields (shlex.quote prevents shell injection) ---
 eval "$(/usr/bin/python3 -c "
-import sys, json
+import sys, json, shlex
 d = json.load(sys.stdin)
-print('EVENT=' + repr(d.get('hook_event_name', '')))
-print('NTYPE=' + repr(d.get('notification_type', '')))
-print('CWD=' + repr(d.get('cwd', '')))
+print('EVENT=' + shlex.quote(d.get('hook_event_name', '')))
+print('NTYPE=' + shlex.quote(d.get('notification_type', '')))
+print('CWD=' + shlex.quote(d.get('cwd', '')))
 " <<< "$INPUT" 2>/dev/null)"
 
 PROJECT="${CWD##*/}"
 [ -z "$PROJECT" ] && PROJECT="claude"
+# Sanitize PROJECT for safe interpolation into AppleScript/notifications
+PROJECT=$(printf '%s' "$PROJECT" | tr -cd '[:alnum:] ._-')
 
 # --- Check annoyed state (rapid prompts) ---
 check_annoyed() {
@@ -189,23 +191,27 @@ TITLE="${MARKER}${PROJECT}: ${STATUS}"
 
 # --- Set tab title via TTY-matched AppleScript ---
 if [ -n "$MY_TTY" ] && [ -n "$TITLE" ]; then
-  osascript <<EOF &
-tell application "Terminal"
-  set targetTTY to "/dev/$MY_TTY"
-  repeat with w in windows
-    repeat with t in tabs of w
-      if tty of t is targetTTY then
-        set custom title of t to "$TITLE"
-        set title displays custom title of t to true
-        set title displays device name of t to false
-        set title displays shell path of t to false
-        set title displays window size of t to false
-        set title displays file name of t to false
-      end if
+  # Use AppleScript variable to avoid injection
+  osascript - "$TITLE" "$MY_TTY" <<'APPLESCRIPT' &
+on run argv
+  set theTitle to item 1 of argv
+  set theTTY to "/dev/" & item 2 of argv
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with t in tabs of w
+        if tty of t is theTTY then
+          set custom title of t to theTitle
+          set title displays custom title of t to true
+          set title displays device name of t to false
+          set title displays shell path of t to false
+          set title displays window size of t to false
+          set title displays file name of t to false
+        end if
+      end repeat
     end repeat
-  end repeat
-end tell
-EOF
+  end tell
+end run
+APPLESCRIPT
 fi
 
 # --- Play sound ---
@@ -220,7 +226,12 @@ fi
 if [ -n "$NOTIFY" ]; then
   FRONTMOST=$(osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' 2>/dev/null)
   if [ "$FRONTMOST" != "Terminal" ]; then
-    osascript -e "display notification \"$MSG\" with title \"$TITLE\"" &
+    # Use AppleScript argv to avoid injection
+    osascript - "$MSG" "$TITLE" <<'APPLESCRIPT' &
+on run argv
+  display notification (item 1 of argv) with title (item 2 of argv)
+end run
+APPLESCRIPT
   fi
 fi
 
