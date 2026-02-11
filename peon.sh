@@ -244,72 +244,180 @@ INPUT=$(cat)
 # Debug log (uncomment to troubleshoot)
 # echo "$(date): peon hook — $INPUT" >> /tmp/peon-ping-debug.log
 
-# --- Load config (shlex.quote prevents shell injection) ---
-eval "$(python3 -c "
-import json, shlex
-try:
-    c = json.load(open('$CONFIG'))
-except:
-    c = {}
-print('ENABLED=' + shlex.quote(str(c.get('enabled', True)).lower()))
-print('VOLUME=' + shlex.quote(str(c.get('volume', 0.5))))
-print('ACTIVE_PACK=' + shlex.quote(c.get('active_pack', 'peon')))
-print('ANNOYED_THRESHOLD=' + shlex.quote(str(c.get('annoyed_threshold', 3))))
-print('ANNOYED_WINDOW=' + shlex.quote(str(c.get('annoyed_window_seconds', 10))))
-cats = c.get('categories', {})
-for cat in ['greeting','acknowledge','complete','error','permission','resource_limit','annoyed']:
-    print('CAT_' + cat.upper() + '=' + shlex.quote(str(cats.get(cat, True)).lower()))
-" 2>/dev/null)"
-
-[ "$ENABLED" = "false" ] && exit 0
-
 PAUSED=false
 [ -f "$PEON_DIR/.paused" ] && PAUSED=true
 
-# --- Parse event fields (shlex.quote prevents shell injection) ---
+# --- Single Python call: config, event parsing, agent detection, category routing, sound picking ---
+# Consolidates 5 separate python3 invocations into one for ~120-200ms faster hook response.
+# Outputs shell variables consumed by the bash play/notify/title logic below.
 eval "$(python3 -c "
-import sys, json, shlex
-d = json.load(sys.stdin)
-print('EVENT=' + shlex.quote(d.get('hook_event_name', '')))
-print('NTYPE=' + shlex.quote(d.get('notification_type', '')))
-print('CWD=' + shlex.quote(d.get('cwd', '')))
-print('SESSION_ID=' + shlex.quote(d.get('session_id', '')))
-print('PERM_MODE=' + shlex.quote(d.get('permission_mode', '')))
-" <<< "$INPUT" 2>/dev/null)"
+import sys, json, os, re, random, time, shlex
+q = shlex.quote
 
-# --- Detect agent/teammate sessions (suppress sounds for non-interactive sessions) ---
-# Only truly autonomous modes are agents; interactive modes (default, acceptEdits, plan) are not.
-# We track agent sessions by session_id because Notification events lack permission_mode.
-AGENT_MODES="delegate"
-IS_AGENT=$(python3 -c "
-import json, os
+config_path = '$CONFIG'
 state_file = '$STATE'
-session_id = '$SESSION_ID'
-perm_mode = '$PERM_MODE'
-agent_modes = set('$AGENT_MODES'.split())
+peon_dir = '$PEON_DIR'
+paused = '$PAUSED' == 'true'
+agent_modes = {'delegate'}
+state_dirty = False
+
+# --- Load config ---
+try:
+    cfg = json.load(open(config_path))
+except:
+    cfg = {}
+
+if str(cfg.get('enabled', True)).lower() == 'false':
+    print('PEON_EXIT=true')
+    sys.exit(0)
+
+volume = cfg.get('volume', 0.5)
+active_pack = cfg.get('active_pack', 'peon')
+annoyed_threshold = int(cfg.get('annoyed_threshold', 3))
+annoyed_window = float(cfg.get('annoyed_window_seconds', 10))
+cats = cfg.get('categories', {})
+cat_enabled = {}
+for c in ['greeting','acknowledge','complete','error','permission','resource_limit','annoyed']:
+    cat_enabled[c] = str(cats.get(c, True)).lower() == 'true'
+
+# --- Parse event JSON from stdin ---
+event_data = json.load(sys.stdin)
+event = event_data.get('hook_event_name', '')
+ntype = event_data.get('notification_type', '')
+cwd = event_data.get('cwd', '')
+session_id = event_data.get('session_id', '')
+perm_mode = event_data.get('permission_mode', '')
+
+# --- Load state ---
 try:
     state = json.load(open(state_file))
 except:
     state = {}
+
+# --- Agent detection ---
 agent_sessions = set(state.get('agent_sessions', []))
 if perm_mode and perm_mode in agent_modes:
     agent_sessions.add(session_id)
     state['agent_sessions'] = list(agent_sessions)
+    state_dirty = True
+    print('PEON_EXIT=true')
     os.makedirs(os.path.dirname(state_file) or '.', exist_ok=True)
     json.dump(state, open(state_file, 'w'))
-    print('true')
+    sys.exit(0)
 elif session_id in agent_sessions:
-    print('true')
+    print('PEON_EXIT=true')
+    sys.exit(0)
+
+# --- Project name ---
+project = cwd.rsplit('/', 1)[-1] if cwd else 'claude'
+if not project:
+    project = 'claude'
+project = re.sub(r'[^a-zA-Z0-9 ._-]', '', project)
+
+# --- Event routing ---
+category = ''
+status = ''
+marker = ''
+notify = ''
+notify_color = ''
+msg = ''
+
+if event == 'SessionStart':
+    category = 'greeting'
+    status = 'ready'
+elif event == 'UserPromptSubmit':
+    status = 'working'
+    if cat_enabled.get('annoyed', True):
+        all_ts = state.get('prompt_timestamps', {})
+        if isinstance(all_ts, list):
+            all_ts = {}
+        now = time.time()
+        ts = [t for t in all_ts.get(session_id, []) if now - t < annoyed_window]
+        ts.append(now)
+        all_ts[session_id] = ts
+        state['prompt_timestamps'] = all_ts
+        state_dirty = True
+        if len(ts) >= annoyed_threshold:
+            category = 'annoyed'
+elif event == 'Stop':
+    category = 'complete'
+    status = 'done'
+    marker = '\u25cf '
+    notify = '1'
+    notify_color = 'blue'
+    msg = project + '  \u2014  Task complete'
+elif event == 'Notification':
+    if ntype == 'permission_prompt':
+        category = 'permission'
+        status = 'needs approval'
+        marker = '\u25cf '
+        notify = '1'
+        notify_color = 'red'
+        msg = project + '  \u2014  Permission needed'
+    elif ntype == 'idle_prompt':
+        status = 'done'
+        marker = '\u25cf '
+        notify = '1'
+        notify_color = 'yellow'
+        msg = project + '  \u2014  Waiting for input'
+    else:
+        print('PEON_EXIT=true')
+        sys.exit(0)
+elif event == 'PermissionRequest':
+    category = 'permission'
+    status = 'needs approval'
+    marker = '\u25cf '
+    notify = '1'
+    notify_color = 'red'
+    msg = project + '  \u2014  Permission needed'
 else:
-    print('false')
-" 2>/dev/null)
+    # Unknown event (e.g. PostToolUseFailure) — exit cleanly
+    print('PEON_EXIT=true')
+    sys.exit(0)
 
-[ "$IS_AGENT" = "true" ] && exit 0
+# --- Check if category is enabled ---
+if category and not cat_enabled.get(category, True):
+    category = ''
 
-PROJECT="${CWD##*/}"
-[ -z "$PROJECT" ] && PROJECT="claude"
-# Sanitize PROJECT for safe interpolation into AppleScript/notifications
-PROJECT=$(printf '%s' "$PROJECT" | tr -cd '[:alnum:] ._-')
+# --- Pick sound (skip if no category or paused) ---
+sound_file = ''
+if category and not paused:
+    pack_dir = os.path.join(peon_dir, 'packs', active_pack)
+    try:
+        manifest = json.load(open(os.path.join(pack_dir, 'manifest.json')))
+        sounds = manifest.get('categories', {}).get(category, {}).get('sounds', [])
+        if sounds:
+            last_played = state.get('last_played', {})
+            last_file = last_played.get(category, '')
+            candidates = sounds if len(sounds) <= 1 else [s for s in sounds if s['file'] != last_file]
+            pick = random.choice(candidates)
+            last_played[category] = pick['file']
+            state['last_played'] = last_played
+            state_dirty = True
+            sound_file = os.path.join(pack_dir, 'sounds', pick['file'])
+    except:
+        pass
+
+# --- Write state once ---
+if state_dirty:
+    os.makedirs(os.path.dirname(state_file) or '.', exist_ok=True)
+    json.dump(state, open(state_file, 'w'))
+
+# --- Output shell variables ---
+print('PEON_EXIT=false')
+print('EVENT=' + q(event))
+print('VOLUME=' + q(str(volume)))
+print('PROJECT=' + q(project))
+print('STATUS=' + q(status))
+print('MARKER=' + q(marker))
+print('NOTIFY=' + q(notify))
+print('NOTIFY_COLOR=' + q(notify_color))
+print('MSG=' + q(msg))
+print('SOUND_FILE=' + q(sound_file))
+" <<< "$INPUT" 2>/dev/null)"
+
+# If Python signalled early exit (disabled, agent, unknown event), bail out
+[ "${PEON_EXIT:-true}" = "true" ] && exit 0
 
 # --- Check for updates (SessionStart only, once per day, non-blocking) ---
 if [ "$EVENT" = "SessionStart" ]; then
@@ -351,145 +459,6 @@ if [ "$EVENT" = "SessionStart" ] && [ "$PAUSED" = "true" ]; then
   echo "peon-ping: sounds paused — run 'peon --resume' or '/peon-ping-toggle' to unpause" >&2
 fi
 
-# --- Check annoyed state (rapid prompts) ---
-check_annoyed() {
-  python3 -c "
-import json, time, sys, os
-
-state_file = '$STATE'
-now = time.time()
-window = float('$ANNOYED_WINDOW')
-threshold = int('$ANNOYED_THRESHOLD')
-
-try:
-    state = json.load(open(state_file))
-except:
-    state = {}
-
-timestamps = state.get('prompt_timestamps', [])
-timestamps = [t for t in timestamps if now - t < window]
-timestamps.append(now)
-
-state['prompt_timestamps'] = timestamps
-os.makedirs(os.path.dirname(state_file) or '.', exist_ok=True)
-json.dump(state, open(state_file, 'w'))
-
-if len(timestamps) >= threshold:
-    print('annoyed')
-else:
-    print('normal')
-" 2>/dev/null
-}
-
-# --- Pick random sound from category, avoiding immediate repeats ---
-pick_sound() {
-  local category="$1"
-  python3 -c "
-import json, random, sys, os
-
-pack_dir = '$PEON_DIR/packs/$ACTIVE_PACK'
-manifest = json.load(open(os.path.join(pack_dir, 'manifest.json')))
-state_file = '$STATE'
-
-try:
-    state = json.load(open(state_file))
-except:
-    state = {}
-
-category = '$category'
-sounds = manifest.get('categories', {}).get(category, {}).get('sounds', [])
-if not sounds:
-    sys.exit(1)
-
-last_played = state.get('last_played', {})
-last_file = last_played.get(category, '')
-
-# Filter out last played (if more than one option)
-candidates = sounds if len(sounds) <= 1 else [s for s in sounds if s['file'] != last_file]
-pick = random.choice(candidates)
-
-# Update state
-last_played[category] = pick['file']
-state['last_played'] = last_played
-json.dump(state, open(state_file, 'w'))
-
-sound_path = os.path.join(pack_dir, 'sounds', pick['file'])
-print(sound_path)
-" 2>/dev/null
-}
-
-# --- Determine category and tab state ---
-CATEGORY=""
-STATUS=""
-MARKER=""
-NOTIFY=""
-MSG=""
-
-case "$EVENT" in
-  SessionStart)
-    CATEGORY="greeting"
-    STATUS="ready"
-    ;;
-  UserPromptSubmit)
-    # No sound normally — user just hit enter, they know.
-    # Exception: annoyed easter egg fires if they're spamming prompts.
-    if [ "$CAT_ANNOYED" = "true" ]; then
-      MOOD=$(check_annoyed)
-      if [ "$MOOD" = "annoyed" ]; then
-        CATEGORY="annoyed"
-      fi
-    fi
-    STATUS="working"
-    ;;
-  Stop)
-    CATEGORY="complete"
-    STATUS="done"
-    MARKER="● "
-    NOTIFY=1
-    NOTIFY_COLOR="blue"
-    MSG="$PROJECT  —  Task complete"
-    ;;
-  Notification)
-    if [ "$NTYPE" = "permission_prompt" ]; then
-      CATEGORY="permission"
-      STATUS="needs approval"
-      MARKER="● "
-      NOTIFY=1
-      NOTIFY_COLOR="red"
-      MSG="$PROJECT  —  Permission needed"
-    elif [ "$NTYPE" = "idle_prompt" ]; then
-      # No sound — Stop already played the completion sound.
-      STATUS="done"
-      MARKER="● "
-      NOTIFY=1
-      NOTIFY_COLOR="yellow"
-      MSG="$PROJECT  —  Waiting for input"
-    else
-      exit 0
-    fi
-    ;;
-  PermissionRequest)
-    # Fires in IDE (VSCode) when a permission dialog appears.
-    # Notification with permission_prompt only fires in CLI, so this
-    # ensures IDE users also hear the permission sound.
-    CATEGORY="permission"
-    STATUS="needs approval"
-    MARKER="● "
-    NOTIFY=1
-    NOTIFY_COLOR="red"
-    MSG="$PROJECT  —  Permission needed"
-    ;;
-  # PostToolUseFailure — no sound. Claude retries on its own.
-  *)
-    exit 0
-    ;;
-esac
-
-# --- Check if category is enabled ---
-CAT_VAR="CAT_$(echo "$CATEGORY" | tr '[:lower:]' '[:upper:]')"
-CAT_ENABLED="${!CAT_VAR:-true}"
-[ "$CAT_ENABLED" = "false" ] && CATEGORY=""
-
 # --- Build tab title ---
 TITLE="${MARKER}${PROJECT}: ${STATUS}"
 
@@ -499,11 +468,8 @@ if [ -n "$TITLE" ]; then
 fi
 
 # --- Play sound ---
-if [ -n "$CATEGORY" ] && [ "$PAUSED" != "true" ]; then
-  SOUND_FILE=$(pick_sound "$CATEGORY")
-  if [ -n "$SOUND_FILE" ] && [ -f "$SOUND_FILE" ]; then
-    play_sound "$SOUND_FILE" "$VOLUME"
-  fi
+if [ -n "$SOUND_FILE" ] && [ -f "$SOUND_FILE" ]; then
+  play_sound "$SOUND_FILE" "$VOLUME"
 fi
 
 # --- Smart notification: only when terminal is NOT frontmost ---
